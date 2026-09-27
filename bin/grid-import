@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Compute side (Linux): prepare a Carre run for a DivGeo case of this repository.
+
+src=${BASH_SOURCE[0]}
+while [ -L "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd); src=$(readlink "$src")
+  case $src in /*) ;; *) src=$dir/$src ;; esac
+done
+SG_ROOT=$(cd -P "$(dirname "$src")/.." && pwd)
+. "$SG_ROOT/lib/common.sh"
+
+usage() {
+  cat <<EOF
+Usage: $SG_PROG [-d DEVICE] [-w WORKDIR] CASE
+
+Prepare a Carre run for the DivGeo case devices/DEVICE/cases/CASE. Needs the
+SOLPS-ITER environment ('source \$SOLPSTOP/setup.csh').
+
+  1. copies the case files (CASE.dgo/.str/.trg, CASE.dg, the equilibrium, ...)
+     into the Carre work directory, keeping their timestamps
+  2. runs SOLPS' 'lns CASE' there: it creates the dg.*, uinput.* and param.dg
+     links used by Carre and Uinp, and copies the design to \$DG/device/DEVICE
+
+Afterwards run 'carre -' in the work directory, and 'grid-export CASE' once
+Carre has stored the grid.
+
+Work directory, first match wins:
+  -w WORKDIR                        exactly this directory
+  \$GRID_WORKDIR/DEVICE/CASE         GRID_WORKDIR from the environment or local.env
+  \$SOLPSWORK/grids/DEVICE/CASE      default (setup.csh sets SOLPSWORK to
+                                    \$SOLPSTOP/runs unless you set it yourself)
+
+Options:
+  -d DEVICE   device (tokamak) name, at most 12 characters (default: \$DEVICE)
+  -w WORKDIR  work directory for this case
+  -h, --help  show this help
+EOF
+}
+
+sg_load_config
+workdir_opt=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -d)        [ $# -ge 2 ] || sg_die "-d needs a device name"; DEVICE=$2; shift 2 ;;
+    -d?*)      DEVICE=${1#-d}; shift ;;
+    -w)        [ $# -ge 2 ] || sg_die "-w needs a directory"; workdir_opt=$2; shift 2 ;;
+    -w?*)      workdir_opt=${1#-w}; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*)        sg_die "unknown option '$1' (see --help)" ;;
+    *)         break ;;
+  esac
+done
+[ $# -eq 1 ] || { usage >&2; exit 2; }
+case=$1
+sg_require_device
+sg_check_name case "$case"
+sg_require_solps
+
+casedir=$SG_ROOT/devices/$DEVICE/cases/$case
+[ -d "$casedir" ] || sg_die "no such case folder: $casedir (git pull?)"
+for ext in dgo str trg; do
+  [ -f "$casedir/$case.$ext" ] ||
+    sg_die "$case.$ext is missing in $casedir: use File|Output in DivGeo, then commit, push and pull"
+done
+equ=$(awk '$1 == "#" && $2 == "equil" { print $3; exit }' "$casedir/$case.trg")
+[ -n "$equ" ] || sg_die "$case.trg names no equilibrium (no '# equil' line)"
+equ_name=${equ##*/}
+[ -f "$casedir/$equ_name" ] ||
+  sg_die "the equilibrium $equ_name is not in the case folder: run 'bin/dg --fix $case' on the Mac and commit it"
+
+lns_cmd=$(command -v lns) || lns_cmd=$SOLPSTOP/scripts/lns
+[ -x "$lns_cmd" ] || sg_die "SOLPS' lns script not found (is setup.csh sourced?)"
+sg_check_solps_divgeo_version
+
+workdir=$(sg_workdir "$case" "$workdir_opt")
+mkdir -p "$workdir" || sg_die "cannot create $workdir"
+
+# Regular files only: DivGeo backups (*~) and any links are not part of the design
+n=0
+for f in "$casedir"/*; do
+  [ -f "$f" ] && [ ! -L "$f" ] || continue
+  case $f in *~) continue ;; esac
+  cp -p "$f" "$workdir/" || sg_die "cannot copy $f to $workdir"
+  n=$((n + 1))
+done
+sg_info "copied $n case files to $workdir"
+
+# lns resolves the equilibrium from the '# equil' line of CASE.trg; point it at
+# the copy in the work directory in case the line still holds a Mac path
+if [ "$equ" != "$equ_name" ]; then
+  tmp=$(mktemp "$workdir/$case.trg.XXXXXX") || sg_die "mktemp failed"
+  awk -v e="$equ_name" '$1 == "#" && $2 == "equil" { $3 = e } { print }' \
+    "$workdir/$case.trg" > "$tmp" && sg_replace_keep_mtime "$workdir/$case.trg" "$tmp" ||
+    sg_die "cannot update $workdir/$case.trg"
+fi
+
+# Create the device directory up front, so that lns does not ask for it
+dgdev=$(sg_dg_device_dir)
+mkdir -p "$dgdev" || sg_die "cannot create $dgdev"
+
+# DGSONNETMASK is a directory for lns, but a file pattern for DivGeo: do not
+# pass on a pattern from the environment
+( cd "$workdir" && env -u DGSONNETMASK DEVICE="$DEVICE" "$lns_cmd" "$case" ) ||
+  sg_die "lns $case failed in $workdir"
+
+sg_info "case $DEVICE/$case is ready for Carre in $workdir"
+[ -z "$CARRE_STOREDIR" ] ||
+  sg_warn "CARRE_STOREDIR is set ($CARRE_STOREDIR): 'carre -' would read its input from there instead of the work directory; clear it first (csh: unsetenv CARRE_STOREDIR)"
+[ -z "$CARRE_GRIDDIR" ] ||
+  sg_info "note: CARRE_GRIDDIR is set, so Carre stores its grids in $CARRE_GRIDDIR"
+cat <<EOF
+
+Next steps:
+  cd $workdir
+  carre -        # P: prepare input from DivGeo, G: grid, C: convert, T: store, Q: quit
+  $SG_ROOT/bin/grid-export -d $DEVICE $case
+EOF

@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Compute side (Linux): bring the grids stored by Carre (and optionally the
+# Triang templates) back into this repository, for checking them in DivGeo.
+
+src=${BASH_SOURCE[0]}
+while [ -L "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd); src=$(readlink "$src")
+  case $src in /*) ;; *) src=$dir/$src ;; esac
+done
+SG_ROOT=$(cd -P "$(dirname "$src")/.." && pwd)
+. "$SG_ROOT/lib/common.sh"
+
+usage() {
+  cat <<EOF
+Usage: $SG_PROG [-d DEVICE] [-w WORKDIR] [--triang] [--commit] CASE
+
+Copy what Carre's "T" (store) step left in the work directory of CASE into
+devices/DEVICE/meshes/CASE/, where bin/dg's File|Import|Mesh looks:
+  CASE.vNNN.sno    grid in DivGeo (Sonnet) format
+  CASE.vNNN.geo    grid in B2.5 format
+  CASE.vNNN.ps     PostScript plot of the grid, if Carre made one
+  CARRE.HISTORY    Carre's log of the stored grids
+Needs the SOLPS-ITER environment ('source \$SOLPSTOP/setup.csh').
+
+Options:
+  -d DEVICE   device (tokamak) name, at most 12 characters (default: \$DEVICE)
+  -w WORKDIR  work directory of the case (default: as for grid-import)
+  --triang    also copy the Triang templates of DEVICE (template.*.tria, written
+              by the "c"/"C" steps of 'triang') to devices/DEVICE/templates/triang/
+  --commit    git add and git commit the copied files (git push is left to you)
+  -h, --help  show this help
+EOF
+}
+
+sg_load_config
+workdir_opt= triang= commit=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -d)        [ $# -ge 2 ] || sg_die "-d needs a device name"; DEVICE=$2; shift 2 ;;
+    -d?*)      DEVICE=${1#-d}; shift ;;
+    -w)        [ $# -ge 2 ] || sg_die "-w needs a directory"; workdir_opt=$2; shift 2 ;;
+    -w?*)      workdir_opt=${1#-w}; shift ;;
+    --triang)  triang=1; shift ;;
+    --commit)  commit=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*)        sg_die "unknown option '$1' (see --help)" ;;
+    *)         break ;;
+  esac
+done
+[ $# -eq 1 ] || { usage >&2; exit 2; }
+case=$1
+sg_require_device
+sg_check_name case "$case"
+sg_require_solps
+
+workdir=$(sg_workdir "$case" "$workdir_opt")
+[ -d "$workdir" ] || sg_die "no work directory $workdir (run grid-import first, or give -w)"
+
+files=()
+for f in "$workdir/$case".v[0-9][0-9][0-9].sno "$workdir/$case".v[0-9][0-9][0-9].geo \
+         "$workdir/CARRE.HISTORY"; do
+  [ -f "$f" ] && files+=("$f")
+done
+# Carre writes the PostScript plot (if ctrans exists) only to its grid directory
+griddir=${CARRE_GRIDDIR:-$SOLPSTOP/modules/Carre/meshes/$DEVICE}
+for f in "$griddir/$case".v[0-9][0-9][0-9].ps; do
+  [ -f "$f" ] && files+=("$f")
+done
+[ ${#files[@]} -gt 0 ] ||
+  sg_die "no stored grids of $case in $workdir: use T (store) in 'carre -' first"
+
+changed=()
+# copy_into DESTDIR FILE...: copy with timestamps, remember new or changed files
+copy_into() {
+  local dest=$1 f; shift
+  mkdir -p "$dest" || sg_die "cannot create $dest"
+  for f in "$@"; do
+    cmp -s "$f" "$dest/${f##*/}" && continue
+    cp -p "$f" "$dest/" || sg_die "cannot copy $f"
+    changed+=("$dest/${f##*/}")
+    sg_info "${dest#"$SG_ROOT"/}/${f##*/}"
+  done
+}
+
+copy_into "$SG_ROOT/devices/$DEVICE/meshes/$case" "${files[@]}"
+
+if [ -n "$triang" ]; then
+  tdir=${CNVTRIOUT:-$(sg_dg_device_dir)}
+  [ ! -d "$tdir/templates" ] || tdir=$tdir/templates
+  tfiles=()
+  for f in "$tdir"/template.*.tria; do
+    [ -f "$f" ] && tfiles+=("$f")
+  done
+  if [ ${#tfiles[@]} -gt 0 ]; then
+    copy_into "$SG_ROOT/devices/$DEVICE/templates/triang" "${tfiles[@]}"
+  else
+    sg_warn "no Triang templates (template.*.tria) in $tdir"
+  fi
+fi
+
+if [ ${#changed[@]} -eq 0 ]; then
+  sg_info "nothing new: the repository already has these files"
+  exit 0
+fi
+sg_info "${#changed[@]} new or updated file(s)"
+
+latest=
+for f in "${files[@]}"; do
+  case $f in *.sno) latest=${f##*/}; latest=${latest%.sno} ;; esac
+done
+if [ -n "$commit" ]; then
+  git -C "$SG_ROOT" add -- "${changed[@]}" &&
+    git -C "$SG_ROOT" commit -q -m "Grids for $DEVICE/$case${latest:+ (latest: $latest)}" -- "${changed[@]}" ||
+    sg_die "git commit failed"
+  sg_info "committed; now run: git -C $SG_ROOT push"
+else
+  sg_info "to share them: cd $SG_ROOT && git add devices/$DEVICE && git commit && git push"
+fi
+sg_info "on the Mac: git pull, then bin/dg -d $DEVICE $case and File|Import|Mesh"

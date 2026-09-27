@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# Build DivGeo (dg.exe) on macOS from a DivGeo git repository alone -- no
+# SOLPS-ITER checkout or environment needed -- and install it as a "kit":
+#
+#   <kit>/bin/dg.exe, dg.dgc, dg.dgh   program + configuration + help (found next to dg.exe)
+#   <kit>/share/topologies/            topologies for File|Import|Topology
+#   <kit>/VERSION                      what was built, from where
+#   <kit>/lib/, share/X11/             only with --bundle: private copies of the MacPorts
+#                                      libraries and X11 data, so the kit runs without MacPorts
+
+src=${BASH_SOURCE[0]}
+while [ -L "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd); src=$(readlink "$src")
+  case $src in /*) ;; *) src=$dir/$src ;; esac
+done
+SG_ROOT=$(cd -P "$(dirname "$src")/.." && pwd)
+. "$SG_ROOT/lib/common.sh"
+
+DIVGEO_URL=https://github.com/iterorganization/DivGeo.git
+
+usage() {
+  cat <<EOF
+Usage: $SG_PROG [--src SRC] [--ref REF] [--prefix DIR] [--bundle] [-j N] [--keep-build]
+
+Build DivGeo for macOS (MacPorts Motif + XQuartz) and install it as a kit
+that bin/dg starts.
+
+Options:
+  --src SRC     DivGeo git repository: a local checkout or a URL. Default: \$DIVGEO_SRC,
+                else \$SOLPSTOP/modules/DivGeo if it exists, else
+                $DIVGEO_URL
+  --ref REF     tag, branch or commit to build. Default: DIVGEO_VERSION of this
+                repository ($(sg_divgeo_version)), else the default branch of SRC
+  --prefix DIR  where to install the kit. Default: \$DG_KIT, else $SG_ROOT/.dgkit
+  --bundle      copy the MacPorts libraries and X11 data into the kit, so that it also
+                runs on a Mac without MacPorts (XQuartz is still needed there)
+  -j N          parallel make jobs (default: number of CPUs)
+  --keep-build  keep the temporary build directory
+  -h, --help    show this help
+
+Requirements: Xcode command line tools, XQuartz, and
+  sudo port install motif xorg-libXp gmake
+EOF
+}
+
+sg_load_config
+src= ref= prefix= bundle= keep= jobs=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --src)        [ $# -ge 2 ] || sg_die "$1 needs a value"; src=$2; shift 2 ;;
+    --ref)        [ $# -ge 2 ] || sg_die "$1 needs a value"; ref=$2; shift 2 ;;
+    --prefix)     [ $# -ge 2 ] || sg_die "$1 needs a value"; prefix=$2; shift 2 ;;
+    --bundle)     bundle=1; shift ;;
+    -j)           [ $# -ge 2 ] || sg_die "$1 needs a value"; jobs=$2; shift 2 ;;
+    -j*)          jobs=${1#-j}; shift ;;
+    --keep-build) keep=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            sg_die "unknown argument '$1' (see --help)" ;;
+  esac
+done
+
+[ "$(uname)" = Darwin ] ||
+  sg_die "this script builds DivGeo for macOS; on Linux DivGeo is built with SOLPS-ITER ('make divgeo')"
+
+# --- prerequisites ---------------------------------------------------------
+MP=${MACPORTS_PREFIX:-/opt/local}
+missing=
+[ -f "$MP/include/Xm/Xm.h" ] || missing="$missing motif"
+[ -f "$MP/lib/libXp.dylib" ] || missing="$missing xorg-libXp"
+[ -z "$missing" ] || sg_die "missing MacPorts packages; install them with: sudo port install$missing"
+command -v clang >/dev/null || sg_die "no C compiler: install Xcode or run 'xcode-select --install'"
+command -v git >/dev/null || sg_die "git not found"
+make_cmd=$(command -v gmake || command -v make) || sg_die "make not found"
+[ -d /opt/X11 ] || sg_warn "XQuartz is not installed (/opt/X11): it is needed to run DivGeo, see https://www.xquartz.org"
+[ -n "$jobs" ] || jobs=$(sysctl -n hw.ncpu 2>/dev/null || echo 2)
+
+if [ -z "$src" ]; then
+  if [ -n "$DIVGEO_SRC" ]; then
+    src=$DIVGEO_SRC
+  elif [ -n "$SOLPSTOP" ] && [ -e "$SOLPSTOP/modules/DivGeo/.git" ]; then
+    src=$SOLPSTOP/modules/DivGeo
+  else
+    src=$DIVGEO_URL
+  fi
+fi
+[ -n "$ref" ] || ref=$(sg_divgeo_version)
+
+prefix=${prefix:-${DG_KIT:-$SG_ROOT/.dgkit}}
+case $prefix in /*) ;; *) prefix=$PWD/$prefix ;; esac
+# Never replace a directory that is not a kit made by this script
+if [ -e "$prefix" ] && [ -n "$(ls -A "$prefix" 2>/dev/null)" ] &&
+   ! grep -qx 'kind=divgeo-kit' "$prefix/VERSION" 2>/dev/null; then
+  sg_die "$prefix exists and is not a DivGeo kit; choose another --prefix"
+fi
+
+# --- build -----------------------------------------------------------------
+build=$(mktemp -d "${TMPDIR:-/tmp}/dgkit-build.XXXXXX") || sg_die "mktemp failed"
+cleanup() { [ -n "$keep" ] || rm -rf "$build"; }
+trap cleanup EXIT
+
+sg_info "cloning DivGeo from $src"
+git clone --quiet "$src" "$build/DivGeo" || sg_die "git clone of $src failed"
+if [ -n "$ref" ]; then
+  git -C "$build/DivGeo" -c advice.detachedHead=false checkout --quiet "$ref" ||
+    sg_die "cannot check out '$ref' in $src"
+fi
+describe=$(git -C "$build/DivGeo" describe --tags --always)
+commit=$(git -C "$build/DivGeo" rev-parse HEAD)
+
+sg_info "building DivGeo $describe (log: $build/build.log)"
+# Stand-alone build: without SOLPSTOP the DivGeo Makefile skips the SOLPS-ITER
+# SETUP configs and uses only its own config/config.DARWIN.gfortran.
+( cd "$build/DivGeo" &&
+  env -u SOLPSTOP -u SOLPS_CPP -u SOLPS_DEBUG -u NO_MOTIF -u MAKEFLAGS -u MAKELEVEL -u MFLAGS \
+    "$make_cmd" -j "$jobs" HOST_NAME=DARWIN COMPILER=gfortran CC=clang \
+      MOTIF_HOME="$MP" LIBXP_HOME="$MP" XQUARTZ_HOME=/opt/X11 ) > "$build/build.log" 2>&1
+exe=$build/DivGeo/builds/DARWIN.gfortran/dg.exe
+if [ ! -x "$exe" ]; then
+  keep=1
+  grep -E 'error|Error' "$build/build.log" | head -20 >&2
+  sg_die "build failed; see $build/build.log"
+fi
+
+# --- install ---------------------------------------------------------------
+stage=$prefix.new.$$
+rm -rf "$stage"
+mkdir -p "$stage/bin" "$stage/share" || sg_die "cannot create $stage"
+cp "$exe" "$stage/bin/dg.exe" &&
+  cp -L "$build/DivGeo/dg.dgc" "$stage/bin/dg.dgc" &&
+  cp -L "$build/DivGeo/dg.dgh" "$stage/bin/dg.dgh" &&
+  cp -R "$build/DivGeo/topologies" "$stage/share/topologies" || sg_die "cannot install into $stage"
+[ -f "$build/DivGeo/LICENSE.txt" ] && cp "$build/DivGeo/LICENSE.txt" "$stage/"
+
+# Copy the MacPorts libraries dg.exe needs (recursively) into <kit>/lib and point
+# the load commands at them. install_name_tool invalidates code signatures, and
+# Apple silicon refuses to run unsigned code, so everything is re-signed ad hoc.
+bundle_kit() {
+  local kit=$1 f dep name new i=0 todo
+  mkdir -p "$kit/lib" || return 1
+  todo=("$kit/bin/dg.exe")
+  while [ $i -lt ${#todo[@]} ]; do
+    f=${todo[$i]}; i=$((i + 1))
+    for dep in $(otool -L "$f" | awk 'NR > 1 { print $1 }' | grep "^$MP/"); do
+      name=${dep##*/}
+      if [ ! -e "$kit/lib/$name" ]; then
+        cp -L "$dep" "$kit/lib/$name" && chmod u+w "$kit/lib/$name" || return 1
+        todo[${#todo[@]}]=$kit/lib/$name
+      fi
+      case $f in
+        */bin/dg.exe) new=@executable_path/../lib/$name ;;
+        *)            new=@loader_path/$name ;;
+      esac
+      install_name_tool -change "$dep" "$new" "$f" 2>/dev/null || return 1
+    done
+    case $f in
+      */lib/*) install_name_tool -id "@rpath/${f##*/}" "$f" 2>/dev/null || return 1 ;;
+    esac
+  done
+  for f in "$kit"/lib/*.dylib "$kit/bin/dg.exe"; do
+    codesign --force --sign - "$f" 2>/dev/null || { sg_warn "codesign failed for $f"; return 1; }
+    if otool -L "$f" | awk 'NR > 1 { print $1 }' | grep -q "^$MP/"; then
+      sg_warn "$f still refers to $MP"; return 1
+    fi
+  done
+  # Data that libX11 (XLOCALEDIR) and Motif (XMBINDDIR) would look for under $MP;
+  # bin/dg points these variables into the kit.
+  mkdir -p "$kit/share/X11" &&
+    cp -R "$MP/share/X11/locale" "$kit/share/X11/" || return 1
+  [ ! -d "$MP/share/X11/bindings" ] || cp -R "$MP/share/X11/bindings" "$kit/share/X11/"
+}
+
+if [ -n "$bundle" ]; then
+  sg_info "bundling MacPorts libraries"
+  bundle_kit "$stage" || { rm -rf "$stage"; sg_die "bundling failed"; }
+fi
+
+cat > "$stage/VERSION" <<EOF
+kind=divgeo-kit
+ref=${ref:-HEAD}
+describe=$describe
+commit=$commit
+source=$src
+built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+macos=$(sw_vers -productVersion) $(uname -m)
+bundle=$([ -n "$bundle" ] && echo yes || echo no)
+EOF
+
+mkdir -p "$(dirname "$prefix")" || sg_die "cannot create $(dirname "$prefix")"
+rm -rf "$prefix.old"
+if [ -e "$prefix" ]; then mv "$prefix" "$prefix.old" || sg_die "cannot replace $prefix"; fi
+mv "$stage" "$prefix" || sg_die "cannot install $prefix"
+rm -rf "$prefix.old"
+
+sg_info "installed DivGeo $describe in $prefix"
+if [ "$prefix" != "$SG_ROOT/.dgkit" ] && [ "$prefix" != "$DG_KIT" ]; then
+  sg_info "set DG_KIT=$prefix (environment or local.env) so that bin/dg finds it"
+fi
+if [ -n "$bundle" ]; then
+  sg_info "the kit is self-contained: it runs on Macs with $(uname -m), macOS $(sw_vers -productVersion) or newer, and XQuartz"
+fi
+sg_info "start DivGeo with: $SG_ROOT/bin/dg -d DEVICE CASE"

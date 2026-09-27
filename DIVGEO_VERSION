@@ -1,0 +1,5 @@
+# DivGeo version (git tag, branch or commit) the grids in this repository are
+# designed with. bin/build-dg-kit builds this version; bin/dg and grid-import
+# warn if the DivGeo they use differs. Keep it in step with the SOLPS-ITER
+# version on the compute side (git -C $SOLPSTOP/modules/DivGeo describe --tags).
+3.0.10a

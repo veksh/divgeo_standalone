@@ -1,0 +1,23 @@
+# Per-machine settings and the locally built DivGeo kit
+local.env
+.dgkit/
+
+# DivGeo autosave files
+*.dg~
+
+# Links made by SOLPS' dg and lns scripts; they hold absolute paths and are
+# re-created on each machine (Carre requires dg.* to be symbolic links)
+dg.dgc
+dg.dgh
+dg.dgo
+dg.str
+dg.trg
+dg.equ
+dg.aux
+uinput.dg
+uinput.trg
+param.dg
+*.snn
+
+# macOS
+.DS_Store

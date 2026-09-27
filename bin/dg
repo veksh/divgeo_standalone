@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# Start DivGeo for one case of this repository (design side, macOS).
+# Replaces SOLPS-ITER's scripts/dg: no SOLPS environment is needed, and the
+# file dialogs point into the repository instead of $DG/device/$DEVICE.
+
+src=${BASH_SOURCE[0]}
+while [ -L "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd); src=$(readlink "$src")
+  case $src in /*) ;; *) src=$dir/$src ;; esac
+done
+SG_ROOT=$(cd -P "$(dirname "$src")/.." && pwd)
+. "$SG_ROOT/lib/common.sh"
+
+usage() {
+  cat <<EOF
+Usage: $SG_PROG [-d DEVICE] CASE [DG_OPTIONS...]
+       $SG_PROG [-d DEVICE] --fix CASE
+
+Start DivGeo in the case folder devices/DEVICE/cases/CASE (created if needed).
+CASE.dg is opened if it exists; save a new case as CASE.dg, and use File|Output
+to write CASE.dgo/.str/.trg for the compute side.
+
+The file dialogs start in:
+  File|Open, File|Save         devices/DEVICE/cases/CASE/
+  File|Import|Equilibrium      devices/DEVICE/equilibria/
+  File|Import|Template         devices/DEVICE/templates/
+  File|Import|Mesh             devices/DEVICE/meshes/CASE/   (grids from grid-export)
+  File|Export|Mesh             devices/DEVICE/cases/CASE/
+  File|Import|Topology         the topologies of the DivGeo kit
+
+When DivGeo exits, the case is made portable (as with --fix).
+
+Options:
+  -d DEVICE   device (tokamak) name, at most 12 characters (default: \$DEVICE)
+  --fix       only make CASE portable, without starting DivGeo: the equilibrium
+              is copied into the case folder, and the file references stored in
+              *.dg and *.trg (absolute paths on this Mac) are rewritten relative
+              to the case folder
+  -h, --help  show this help
+Other arguments are passed to dg.exe (e.g. -nores).
+
+The DivGeo kit is taken from \$DG_KIT (default: $SG_ROOT/.dgkit);
+build it with bin/build-dg-kit.
+EOF
+}
+
+# --- making a case portable --------------------------------------------------
+
+# Print "kind<TAB>path" for each file referenced by a .dg or .trg file
+list_refs() {
+  awk '$1 == "Equil100"    && NF >= 2 { print "equil\t" $2 }
+       $1 == "Template110" && NF >= 6 { print "template\t" $6 }
+       $1 == "Mesh112"     && NF >= 2 { print "mesh\t" $2 }
+       $1 == "#" && $2 == "equil" && NF >= 3 { print "equil\t" $3 }
+       $1 == "#" && $2 == "mesh"  && NF >= 3 { print "mesh\t" $3 }' "$1" | sort -u
+}
+
+# Rewrite references in FILE according to MAP (lines "old<TAB>new")
+rewrite_refs() {
+  local f=$1 map=$2 tmp
+  tmp=$(mktemp "$f.XXXXXX") || return 1
+  awk 'NR == FNR { split($0, a, "\t"); m[a[1]] = a[2]; next }
+       ($1 == "Equil100" || $1 == "Mesh112") && ($2 in m) { $2 = m[$2] }
+       $1 == "Template110" && ($6 in m) { $6 = m[$6] }
+       $1 == "#" && ($2 == "equil" || $2 == "mesh") && ($3 in m) { $3 = m[$3] }
+       { print }' "$map" "$f" > "$tmp" && sg_replace_keep_mtime "$f" "$tmp"
+}
+
+# Decide the portable form of reference REF of kind KIND; sets NEW_REF
+# (empty = leave unchanged). DivGeo runs in the case folder, so relative
+# paths are relative to it.
+#  - equilibrium: always copied into the case folder, because the compute
+#    side (lns, Carre) looks for it next to CASE.trg
+#  - template/mesh inside the repository: relative path
+#  - anything outside the repository: copied into the case folder
+fix_ref() {
+  local kind=$1 ref=$2 file phys name dest
+  NEW_REF=
+  case $ref in /*) file=$ref ;; *) file=$casedir/$ref ;; esac
+  name=${ref##*/}
+  if [ ! -f "$file" ]; then
+    if [ -f "$casedir/$name" ]; then NEW_REF=$name; else sg_warn "$kind file not found: $ref"; fi
+    return
+  fi
+  phys=$(sg_phys_path "$file")
+  if [ "${phys%/*}" = "$casedir_p" ]; then NEW_REF=$name; return; fi
+  if [ "$kind" != equil ]; then
+    case $phys in
+      "$root_p"/*) NEW_REF=../../../../${phys#"$root_p"/}; return ;;
+    esac
+  fi
+  dest=$casedir/$name
+  if [ -e "$dest" ] && ! cmp -s "$phys" "$dest"; then
+    sg_warn "not copying $ref: the case folder already has a different $name"
+    return
+  fi
+  if [ ! -e "$dest" ]; then
+    cp -p "$phys" "$dest" || return
+    sg_info "copied the $kind file $name into the case folder"
+  fi
+  NEW_REF=$name
+}
+
+fix_case() {
+  local f map kind ref others
+  casedir_p=$(cd -P "$casedir" && pwd -P)
+  root_p=$(cd -P "$SG_ROOT" && pwd -P)
+  map=$(mktemp "${TMPDIR:-/tmp}/sg-refs.XXXXXX") || sg_die "mktemp failed"
+  for f in "$casedir"/*.dg "$casedir"/*.trg; do
+    [ -f "$f" ] || continue
+    : > "$map"
+    while IFS=$'\t' read -r kind ref; do
+      [ -n "$ref" ] || continue
+      fix_ref "$kind" "$ref"
+      [ -z "$NEW_REF" ] || [ "$NEW_REF" = "$ref" ] || printf '%s\t%s\n' "$ref" "$NEW_REF" >> "$map"
+    done <<EOF
+$(list_refs "$f")
+EOF
+    if [ -s "$map" ]; then
+      rewrite_refs "$f" "$map" && sg_info "made the file references in ${f##*/} portable"
+    fi
+  done
+  rm -f "$map"
+
+  if [ -f "$casedir/$case.dg" ]; then
+    if [ ! -f "$casedir/$case.dgo" ]; then
+      sg_info "no $case.dgo yet: use File|Output in DivGeo before importing the case on the compute side"
+    elif [ "$casedir/$case.dg" -nt "$casedir/$case.dgo" ]; then
+      sg_warn "$case.dg is newer than $case.dgo: use File|Output again if the design changed"
+    fi
+  else
+    others=$(cd "$casedir" && ls -- *.dg 2>/dev/null | tr '\n' ' ')
+    [ -z "$others" ] ||
+      sg_warn "the case folder has $others but no $case.dg: grid-import expects the files to be named $case.dg/.dgo/.str/.trg"
+  fi
+}
+
+# Warn if the kit was built from another DivGeo version than DIVGEO_VERSION
+check_kit_version() {
+  local want info
+  want=$(sg_divgeo_version)
+  [ -n "$want" ] && [ -f "$kit/VERSION" ] || return 0
+  info=$'\n'$(cat "$kit/VERSION")$'\n'
+  case $info in
+    *$'\n'"ref=$want"$'\n'*|*$'\n'"describe=$want"$'\n'*|*$'\n'"commit=$want"*) return 0 ;;
+  esac
+  sg_warn "the DivGeo kit is $(sed -n 's/^describe=//p' "$kit/VERSION"), but DIVGEO_VERSION is $want: rebuild it with bin/build-dg-kit"
+}
+
+# --- main ----------------------------------------------------------------------
+
+sg_load_config
+fix_only=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -d)        [ $# -ge 2 ] || sg_die "-d needs a device name"; DEVICE=$2; shift 2 ;;
+    -d?*)      DEVICE=${1#-d}; shift ;;
+    --fix)     fix_only=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --)        shift; break ;;
+    -*)        sg_die "unknown option '$1' (see --help)" ;;
+    *)         break ;;
+  esac
+done
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+case=$1; shift
+sg_require_device
+sg_check_name case "$case"
+devdir=$SG_ROOT/devices/$DEVICE
+casedir=$devdir/cases/$case
+
+if [ -n "$fix_only" ]; then
+  [ -d "$casedir" ] || sg_die "no such case folder: $casedir"
+  fix_case
+  exit 0
+fi
+
+kit=${DG_KIT:-$SG_ROOT/.dgkit}
+exe=$kit/bin/dg.exe
+[ -x "$exe" ] || sg_die "no DivGeo kit in $kit: build it with $SG_ROOT/bin/build-dg-kit (or set DG_KIT)"
+check_kit_version
+[ -n "$DISPLAY" ] ||
+  sg_warn "DISPLAY is not set: is XQuartz installed? (log out and back in after installing it)"
+
+mkdir -p "$casedir" "$devdir/equilibria" "$devdir/templates" "$devdir/meshes/$case" ||
+  sg_die "cannot create the case folders under $devdir"
+
+# File dialog masks read by dg.exe (see x_xapp.c)
+export DG_OPEN_MASK="$casedir/*.dg"
+export DG_SAVE_MASK="$casedir/*.dg"
+export DG_EQUIL_MASK="$devdir/equilibria/*.equ"
+export DG_TEMPLATE_MASK="$devdir/templates/*"
+export DG_EXPORT_TEMPLATE_MASK="$devdir/templates/*.itp"
+export DG_MESH_MASK="$devdir/meshes/$case/*.sno"
+export DG_EXPORT_MESH_MASK="$casedir/*.sno"
+export DG_IMPORT_TOPOLOGY_MASK="$kit/share/topologies/*"
+# A bundled kit carries the X11 data that would otherwise come from MacPorts
+[ ! -d "$kit/share/X11/locale" ] || export XLOCALEDIR=$kit/share/X11/locale
+[ ! -d "$kit/share/X11/bindings" ] || export XMBINDDIR=$kit/share/X11/bindings
+
+cd "$casedir" || exit 1
+open_case=
+if [ -f "$case.dg" ]; then
+  open_case=$case.dg
+  for a in "$@"; do case $a in *.dg) open_case= ;; esac; done
+fi
+sg_info "DivGeo $(sed -n 's/^describe=//p' "$kit/VERSION" 2>/dev/null) for case $DEVICE/$case"
+# dg.exe finds dg.dgc and dg.dgh next to itself because it is started by full path
+"$exe" "$@" ${open_case:+"$open_case"}
+status=$?
+fix_case
+exit $status

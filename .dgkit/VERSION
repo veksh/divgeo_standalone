@@ -1,8 +1,0 @@
-kind=divgeo-kit
-ref=3.0.10a
-describe=3.0.10a
-commit=a919c5cd8871de30bdd5bc13f37bae754c9de93c
-source=https://github.com/iterorganization/DivGeo.git
-built=2026-09-27T23:07:16Z
-macos=15.8 arm64
-bundle=no
